@@ -1,0 +1,14 @@
+# Compiled binaries
+medera
+medera.exe
+*.o
+*.out
+
+# Editor/IDE
+.vscode/
+*.suo
+*.user
+
+# OS files
+.DS_Store
+Thumbs.db

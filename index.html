@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>MedEra</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>MedEra</h1>
+    <p>Patient&ndash;hospital connectivity, appointment management &amp; emergency coordination</p>
+  </header>
+
+  <main>
+    <section class="card">
+      <h2>Find a hospital</h2>
+      <form id="searchForm">
+        <label>City
+          <input type="text" id="cityInput" placeholder="DEHRADUN" required>
+        </label>
+        <label>Area
+          <input type="text" id="areaInput" placeholder="CLEMENT TOWN" required>
+        </label>
+        <button type="submit">Search</button>
+      </form>
+      <div id="searchResults" class="results"></div>
+    </section>
+
+    <section class="card">
+      <h2>Emergency &mdash; nearest hospitals</h2>
+      <form id="emergencyForm">
+        <label>Latitude
+          <input type="number" step="any" id="latInput" placeholder="30.30" required>
+        </label>
+        <label>Longitude
+          <input type="number" step="any" id="lonInput" placeholder="78.02" required>
+        </label>
+        <button type="submit" class="danger">Find nearest hospitals</button>
+      </form>
+      <div id="emergencyResults" class="results"></div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
