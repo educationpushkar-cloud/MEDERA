@@ -1,62 +1,116 @@
-// Talks to the endpoints exposed by src/server.cpp. Requires the server to
-// be running (see the setup note at the top of server.cpp).
+const API = "";   // same-origin: empty prefix
 
-document.getElementById("searchForm").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const city = document.getElementById("cityInput").value.trim().toUpperCase();
-  const area = document.getElementById("areaInput").value.trim().toUpperCase();
+// ---------- helpers ----------
+async function postForm(path, params) {
+    const body = new URLSearchParams(params).toString();
+    const res = await fetch(API + path, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body
+    });
+    return res.json();
+}
 
-  const res = await fetch(`/api/hospitals?city=${encodeURIComponent(city)}&area=${encodeURIComponent(area)}`);
-  const hospitals = await res.json();
+async function getJson(path) {
+    const res = await fetch(API + path);
+    return res.json();
+}
 
-  const container = document.getElementById("searchResults");
-  container.innerHTML = "";
+function render(el, data) {
+    const node = document.getElementById(el);
+    if (typeof data === "string") node.innerHTML = data;
+    else node.innerHTML = "<pre>" + JSON.stringify(data, null, 2) + "</pre>";
+}
 
-  if (hospitals.length === 0) {
-    container.innerHTML = "<p>No hospitals found for that city/area.</p>";
-    return;
-  }
+// ---------- hospital search ----------
+async function searchHospitals() {
+    const city = document.getElementById("searchCity").value.trim().toUpperCase();
+    const area = document.getElementById("searchArea").value.trim().toUpperCase();
+    if (!city || !area) return render("searchResults", "Enter both city and area.");
 
-  hospitals.forEach((h) => {
-    const row = document.createElement("div");
-    row.className = "hospital-row";
-    row.innerHTML = `
-      <div>
-        <div class="name">${h.name}</div>
-        <div class="meta">${h.city} &middot; ${h.area}</div>
-      </div>
-      <div class="meta">
-        Beds: ${h.available_beds}/${h.total_beds} &middot; Rating: ${h.rating}&#9733;
-      </div>`;
-    container.appendChild(row);
-  });
-});
+    const data = await getJson(
+        `/api/hospitals?city=${encodeURIComponent(city)}&area=${encodeURIComponent(area)}`
+    );
+    if (!data.length) return render("searchResults", "No hospitals found.");
+    render("searchResults", data);
+}
 
-document.getElementById("emergencyForm").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const lat = document.getElementById("latInput").value;
-  const lon = document.getElementById("lonInput").value;
+// ---------- emergency nearest ----------
+async function findNearest() {
+    const lat = parseFloat(document.getElementById("emLat").value);
+    const lon = parseFloat(document.getElementById("emLon").value);
+    if (isNaN(lat) || isNaN(lon)) return render("nearestResults", "Enter lat and lon.");
+    const data = await getJson(`/api/emergency/nearest?lat=${lat}&lon=${lon}&k=3`);
+    render("nearestResults", data);
+}
 
-  const res = await fetch(`/api/emergency/nearest?lat=${lat}&lon=${lon}&k=3`);
-  const ranked = await res.json();
+// ---------- emergency request ----------
+async function raiseEmergency() {
+    const patientId = parseInt(document.getElementById("emPatientId").value);
+    const lat = parseFloat(document.getElementById("emReqLat").value);
+    const lon = parseFloat(document.getElementById("emReqLon").value);
+    if (isNaN(patientId) || isNaN(lat) || isNaN(lon))
+        return render("emergencyState", "Fill all fields.");
 
-  const container = document.getElementById("emergencyResults");
-  container.innerHTML = "";
+    const data = await postForm("/api/emergency/request",
+        { patient_id: patientId, lat, lon });
 
-  if (ranked.length === 0) {
-    container.innerHTML = "<p>No hospitals with an available bed were found nearby.</p>";
-    return;
-  }
+    // Auto-advance through the FSM to Accepted to demo the flow.
+    if (data.id) {
+        const accepted = await postForm(`/api/emergency/${data.id}/accept`, {});
+        render("emergencyState", accepted);
+    } else {
+        render("emergencyState", data);
+    }
+}
 
-  ranked.forEach((rh, i) => {
-    const row = document.createElement("div");
-    row.className = "hospital-row";
-    row.innerHTML = `
-      <div>
-        <div class="name">${i + 1}. ${rh.hospital.name}</div>
-        <div class="meta">${rh.distance_km.toFixed(2)} km away &middot; score ${rh.score.toFixed(2)}</div>
-      </div>
-      <div class="meta">Beds: ${rh.hospital.available_beds}/${rh.hospital.total_beds}</div>`;
-    container.appendChild(row);
-  });
-});
+// ---------- appointments ----------
+async function bookAppointment() {
+    const patientId  = parseInt(document.getElementById("bkPatient").value);
+    const hospitalId = parseInt(document.getElementById("bkHospital").value);
+    const doctorId   = parseInt(document.getElementById("bkDoctor").value);
+    if (isNaN(patientId) || isNaN(hospitalId) || isNaN(doctorId))
+        return render("bookResult", "Fill all fields.");
+
+    const data = await postForm("/api/appointments",
+        { patient_id: patientId, hospital_id: hospitalId, doctor_id: doctorId });
+    render("bookResult", data);
+}
+
+async function loadAppointments() {
+    const patientId = parseInt(document.getElementById("myPatient").value);
+    if (isNaN(patientId)) return render("appointmentList", "Enter patient ID.");
+    const data = await getJson(`/api/appointments?patient_id=${patientId}`);
+    render("appointmentList", data);
+}
+
+// ---------- staff ----------
+let currentStaff = null;
+
+async function staffLogin() {
+    const staffId = document.getElementById("staffId").value.trim();
+    const password = document.getElementById("staffPass").value;
+    if (!staffId || !password) return render("staffResult", "Enter both fields.");
+
+    const data = await postForm("/api/staff/login",
+        { staff_id: staffId, password });
+
+    render("staffResult", data);
+
+    if (data.status === "ok") {
+        currentStaff = data.staff;
+        document.getElementById("bedUpdatePanel").style.display = "block";
+        document.getElementById("bedHospital").value = data.staff.hospital_id;
+    }
+}
+
+async function updateBeds() {
+    if (!currentStaff) return render("bedResult", "Login first.");
+    const id = parseInt(document.getElementById("bedHospital").value);
+    const beds = parseInt(document.getElementById("bedCount").value);
+    if (isNaN(id) || isNaN(beds)) return render("bedResult", "Fill all fields.");
+
+    const data = await postForm("/api/hospital/update-beds",
+        { id, available_beds: beds, staff_id: currentStaff.id });
+    render("bedResult", data);
+}
