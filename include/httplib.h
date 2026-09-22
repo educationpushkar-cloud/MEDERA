@@ -8,8 +8,8 @@
 #ifndef CPPHTTPLIB_HTTPLIB_H
 #define CPPHTTPLIB_HTTPLIB_H
 
-#define CPPHTTPLIB_VERSION "0.56.0"
-#define CPPHTTPLIB_VERSION_NUM "0x003800"
+#define CPPHTTPLIB_VERSION "0.57.0"
+#define CPPHTTPLIB_VERSION_NUM "0x003900"
 
 #ifdef _WIN32
 #if defined(_WIN32_WINNT) && _WIN32_WINNT < 0x0A00
@@ -1756,6 +1756,7 @@ struct Request {
 
   // private members...
   bool body_consumed_ = false;
+  bool expect_100_continue_pending_ = false;
   size_t redirect_count_ = CPPHTTPLIB_REDIRECT_MAX_COUNT;
   size_t content_length_ = 0;
   ContentProvider content_provider_;
@@ -13298,7 +13299,10 @@ inline bool Server::write_response_core(Stream &strm, bool close_connection,
   // Prepare additional headers
   if (close_connection ||
       detail::has_header_token(req.headers, "Connection", "close") ||
-      400 <= res.status) { // Don't leave connections open after errors
+      400 <= res.status || // Don't leave connections open after errors
+      // The client withholds the body until `100 Continue`, which was never
+      // sent, so whether and when the body follows is unknown.
+      (req.expect_100_continue_pending_ && detail::has_framed_body(req))) {
     res.set_header("Connection", "close");
   } else {
     std::string s = "timeout=";
@@ -13548,6 +13552,13 @@ inline bool Server::read_content_core(
     return true;
   }
 #endif
+
+  // The client is waiting for this before it sends the body.
+  if (req.expect_100_continue_pending_) {
+    req.expect_100_continue_pending_ = false;
+    detail::write_response_line(strm, StatusCode::Continue_100);
+    strm.write("\r\n");
+  }
 
   if (!detail::read_content(strm, req, payload_max_length_, res.status, nullptr,
                             out, true)) {
@@ -14386,19 +14397,20 @@ Server::process_request(Stream &strm, const std::string &remote_addr,
   // case-insensitive, and a 100-continue expectation in an HTTP/1.0 request
   // must be ignored. An expectation we do not recognize is left alone; the
   // 417 the section allows for one is a MAY, not a requirement.
+  //
+  // `100 Continue` itself is deferred until the body is actually read (see
+  // read_content_core), so a request rejected by a later handler never
+  // invites the client to send a body nobody will read.
   if (req.version != "HTTP/1.0" &&
       detail::has_header_token(req.headers, "Expect", "100-continue")) {
     int status = StatusCode::Continue_100;
     if (expect_100_continue_handler_) {
       status = expect_100_continue_handler_(req, res);
     }
-    switch (status) {
-    case StatusCode::Continue_100:
-    case StatusCode::ExpectationFailed_417:
-      detail::write_response_line(strm, status);
-      strm.write("\r\n");
-      break;
-    default:
+    if (status == StatusCode::Continue_100) {
+      req.expect_100_continue_pending_ = true;
+    } else {
+      if (res.status == -1) { res.status = status; }
       connection_closed = true;
       return write_response(strm, true, req, res);
     }
@@ -14411,18 +14423,25 @@ Server::process_request(Stream &strm, const std::string &remote_addr,
   };
 
   // WebSocket upgrade
-  // Check pre_routing_handler_ before upgrading so that authentication
-  // and other middleware can reject the request with an HTTP response
-  // (e.g., 401) before the protocol switches.
+  // Run pre_routing_handler_ and pre_request_handler_ before upgrading so
+  // that authentication and other middleware can reject the request with an
+  // HTTP response (e.g., 401) before the protocol switches.
   if (detail::is_websocket_upgrade(req)) {
     if (pre_routing_handler_ &&
         pre_routing_handler_(req, res) == HandlerResponse::Handled) {
       if (res.status == -1) { res.status = StatusCode::OK_200; }
-      return write_response(strm, close_connection, req, res);
+      return write_response_with_content(strm, close_connection, req, res);
     }
     // Find matching WebSocket handler
     for (const auto &entry : websocket_handlers_) {
       if (entry.matcher->match(req)) {
+        req.matched_route = entry.matcher->pattern();
+        if (pre_request_handler_ &&
+            pre_request_handler_(req, res) == HandlerResponse::Handled) {
+          if (res.status == -1) { res.status = StatusCode::OK_200; }
+          return write_response_with_content(strm, close_connection, req, res);
+        }
+
         // Compute accept key
         auto client_key = req.get_header_value("Sec-WebSocket-Key");
         auto accept_key = detail::websocket_accept_key(client_key);
@@ -15282,22 +15301,45 @@ inline ssize_t ChunkedDecoder::read_payload(char *buf, size_t len,
     stream_line_reader lr(strm, line_buf, sizeof(line_buf));
     if (!lr.getline()) { return -1; }
 
+    // Everything below is bounded by eol rather than by the buffer's NUL, so
+    // the line terminator is never mistaken for line content.
+    const char *eol = lr.ptr() + lr.size();
+    if (lr.end_with_crlf()) {
+      eol -= 2;
+    } else if (eol != lr.ptr() && eol[-1] == '\n') {
+      // Only reachable under CPPHTTPLIB_ALLOW_LF_AS_LINE_TERMINATOR, where
+      // getline() ends the line on a bare LF. That LF is the terminator, so it
+      // has to come off here or the check below would reject the line.
+      eol -= 1;
+    }
+
     // RFC 9112 §7.1: chunk-size = 1*HEXDIG
     const char *p = lr.ptr();
     int v = 0;
-    if (!is_hex(*p, v)) { return -1; }
+    if (p == eol || !is_hex(*p, v)) { return -1; }
 
     size_t chunk_len = 0;
     constexpr size_t chunk_len_max = (std::numeric_limits<size_t>::max)();
-    for (; is_hex(*p, v); ++p) {
+    for (; p < eol && is_hex(*p, v); ++p) {
       if (chunk_len > (chunk_len_max >> 4)) { return -1; }
       chunk_len = (chunk_len << 4) | static_cast<size_t>(v);
     }
 
-    while (is_space_or_tab(*p)) {
+    while (p < eol && is_space_or_tab(*p)) {
       ++p;
     }
-    if (*p != '\0' && *p != ';' && *p != '\r' && *p != '\n') { return -1; }
+
+    // RFC 9112 §7.1.1: only a chunk-ext may sit between the size and the line
+    // terminator, and it is built from tokens and quoted-strings, so it never
+    // holds a CR, LF or any other control character. getline() reads up to the
+    // CRLF, so a bare LF left in here would be swallowed as extension text
+    // while an intermediary that ends the line on it delimits the chunks
+    // differently, and the two disagree on where the body ends (request
+    // smuggling).
+    if (p < eol && *p != ';') { return -1; }
+    for (; p < eol; ++p) {
+      if (!is_space_or_tab(*p) && !fields::is_field_vchar(*p)) { return -1; }
+    }
 
     if (chunk_len == 0) {
       chunk_remaining = 0;
@@ -19322,11 +19364,11 @@ inline void shutdown(session_t session, bool graceful) {
 
   auto ssl = static_cast<SSL *>(session);
   if (graceful) {
-    // First call sends close_notify
-    if (SSL_shutdown(ssl) == 0) {
-      // Second call waits for peer's close_notify
-      SSL_shutdown(ssl);
-    }
+    // Send close_notify without waiting for the peer's. The connection is
+    // closed right after this, so a unidirectional shutdown is enough, and an
+    // idle peer that never answers would otherwise hold this thread until the
+    // read timeout. The other backends do not wait either.
+    SSL_shutdown(ssl);
   }
 }
 

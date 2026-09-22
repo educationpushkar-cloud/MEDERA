@@ -23,8 +23,12 @@
 // wants richer JSON later, nlohmann/json (also single-header) is the natural
 // next addition.
 // ---------------------------------------------------------------------------
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 
 #include "httplib.h"
+
 #include "models.h"
 #include "storage.h"
 #include "hashindex.h"
